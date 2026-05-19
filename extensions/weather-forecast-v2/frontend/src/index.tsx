@@ -14,6 +14,10 @@ export interface ExtensionComponentProps {
   dataSource?: DataSource
   className?: string
   config?: Record<string, any>
+  // configSchema fields passed as individual props by host
+  defaultCity?: string
+  refreshInterval?: number
+  unit?: string
 }
 
 export interface DataSource {
@@ -95,20 +99,14 @@ const CSS_ID = 'wfc-styles-v2'
 
 const STYLES = `
 .wfc {
-  --wfc-fg: hsl(240 10% 10%);
-  --wfc-muted: hsl(240 5% 45%);
-  --wfc-accent: hsl(221 83% 53%);
-  --wfc-card: rgba(255,255,255,0.5);
-  --wfc-border: rgba(0,0,0,0.06);
+  --wfc-fg: var(--foreground);
+  --wfc-muted: var(--muted-foreground);
+  --wfc-accent: var(--primary);
+  --wfc-card: var(--card);
+  --wfc-border: var(--border);
   width: 100%;
   height: 100%;
   font-size: 12px;
-}
-.dark .wfc {
-  --wfc-fg: hsl(0 0% 95%);
-  --wfc-muted: hsl(0 0% 60%);
-  --wfc-card: rgba(30,30,30,0.5);
-  --wfc-border: rgba(255,255,255,0.08);
 }
 .wfc-card {
   display: flex;
@@ -176,8 +174,8 @@ const STYLES = `
   font-size: 9px;
   color: var(--wfc-muted);
 }
-.wfc-dot { width: 5px; height: 5px; border-radius: 50%; background: #22c55e; }
-.wfc-dot.stale { background: #f59e0b; }
+.wfc-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--color-success); }
+.wfc-dot.stale { background: var(--color-warning); }
 
 .wfc-loading, .wfc-error {
   display: flex;
@@ -255,11 +253,11 @@ export interface WeatherCardProps extends ExtensionComponentProps {
 
 export const WeatherCard = forwardRef<HTMLDivElement, WeatherCardProps>(
   function WeatherCard(props, ref) {
-    const { dataSource, className = '', config, defaultCity: propCity = 'Beijing', unit = 'celsius' } = props
+    const { dataSource, className = '', defaultCity: propCity = 'Beijing', refreshInterval: propRefreshInterval = 300000, unit = 'celsius' } = props
 
     useEffect(() => injectStyles(), [])
 
-    const city = config?.defaultCity || propCity
+    const city = propCity
     const extensionId = dataSource?.extensionId || EXTENSION_ID
 
     const [weather, setWeather] = useState<WeatherData | null>(null)
@@ -297,7 +295,7 @@ export const WeatherCard = forwardRef<HTMLDivElement, WeatherCardProps>(
 
     // Auto refresh
     useEffect(() => {
-      const interval = config?.refreshInterval || 300000
+      const interval = propRefreshInterval
       if (interval <= 0) return
       const id = setInterval(async () => {
         if (!mountedRef.current) return
@@ -308,7 +306,7 @@ export const WeatherCard = forwardRef<HTMLDivElement, WeatherCardProps>(
         }
       }, interval)
       return () => clearInterval(id)
-    }, [extensionId, city, config?.refreshInterval])
+    }, [extensionId, city, propRefreshInterval])
 
     const handleRefresh = useCallback(async () => {
       setLoading(true)

@@ -61,25 +61,72 @@ cargo test
 
 ### Release Process
 
+#### Version Model
+
+本仓库有三个层级的版本号，发布时**必须全部一致**（除非有明确理由保持不同）：
+
+| 文件 | 版本含义 | 示例 |
+|------|---------|------|
+| `VERSION` | 市场发布版本 | `2.7.0` |
+| `extensions/index.json` → `version` | 市场发布版本 | `2.7.0` |
+| `extensions/*/Cargo.toml` → `version` | 扩展自身版本（影响包文件名） | `2.7.0` |
+| `extensions/*/metadata.json` → `version` | 自动从 Cargo.toml 读取 | `2.7.0` |
+
+**常见错误**：只更新了 `VERSION` 和 `index.json`，但忘了更新各扩展的 `Cargo.toml`。这会导致：
+- 包文件名是旧版本：`xxx-2.6.0-windows_amd64.nep`
+- GitHub Release 标题是 v2.7.0，但里面的包都是 2.6.0
+- 用户体验混乱
+
+#### 发布步骤
+
 ```bash
-# 1. Update JSON files
-./scripts/update-versions.sh 2.4.0
+VERSION=2.7.0
 
-# 2. Commit version bump
-git add . && git commit -m "chore: bump to v2.4.0"
+# Step 1: 一步到位 — 同步 Cargo.toml + VERSION + 生成 JSON
+./scripts/update-versions.sh $VERSION --bump-extensions
 
-# 3. Build and package
-./release.sh 2.4.0
-# or: ./build.sh --release 2.4.0
+# Step 2: 验证版本一致性（必须通过！）
+./scripts/update-versions.sh $VERSION --check
 
-# 4. Verify packages
-ls -la dist/*.nep
+# Step 3: 提交版本变更
+git add . && git commit -m "chore: bump to v$VERSION"
 
-# 5. Tag and release
-git tag v2.4.0
+# Step 4: 构建和打包
+./build.sh --release $VERSION
+
+# Step 5: 验证包文件名版本一致
+ls dist/*.nep
+# 确认所有文件名包含正确版本号，如：weather-forecast-v2-2.7.0-darwin_aarch64.nep
+
+# Step 6: Tag 和发布
+git tag v$VERSION
 git push origin main --tags
-gh release create v2.4.0 ./dist/*.nep --title "v2.4.0"
+gh release create v$VERSION ./dist/*.nep --title "v$VERSION"
 ```
+
+#### update-versions.sh 用法
+
+```bash
+# 完整更新：同步 Cargo.toml + VERSION + 生成 JSON（推荐）
+./scripts/update-versions.sh 2.7.0 --bump-extensions
+
+# 仅生成 JSON 文件（不修改 Cargo.toml）
+./scripts/update-versions.sh 2.7.0
+
+# 仅检查版本一致性
+./scripts/update-versions.sh 2.7.0 --check
+
+# 不传版本参数时从 VERSION 文件读取
+./scripts/update-versions.sh --check
+```
+
+#### 发布前检查清单
+
+- [ ] `VERSION` 文件版本正确
+- [ ] `./scripts/update-versions.sh $VERSION --check` 通过
+- [ ] 所有 `Cargo.toml` 版本与市场版本一致
+- [ ] `dist/*.nep` 包文件名版本一致
+- [ ] `index.json` 中每个扩展的 `version` 和 `builds` URL 版本一致
 
 ### Legacy Scripts (Removed)
 
@@ -172,17 +219,106 @@ neomind_extension_sdk::neomind_export!(MyExtension);
       "defaultSize": { "width": 340, "height": 320 },
       "minSize": { "width": 240, "height": 260 },
       "maxSize": { "width": 480, "height": 400 },
+      "refreshable": true,
+      "refreshInterval": 30000,
+      "hasDataSource": true,
+      "dataSourceAllowedTypes": ["device"],
       "configSchema": {
-        "defaultCity": {
+        "contentType": {
           "type": "string",
-          "default": "Beijing",
-          "description": "Default city"
+          "title": "Content Type",
+          "description": "Type of content",
+          "enum": ["none", "text", "markdown", "html", "image-url"],
+          "enumTitles": ["None", "Plain Text", "Markdown", "HTML", "Image URL"],
+          "default": "none"
+        },
+        "textContent": {
+          "type": "string",
+          "title": "Text Content",
+          "description": "Content for text/markdown/html mode"
+        },
+        "imageUrl": {
+          "type": "string",
+          "title": "Image URL",
+          "description": "Image URL for image-url mode"
         }
+      },
+      "uiHints": {
+        "fieldOrder": ["contentType", "textContent", "imageUrl"],
+        "visibilityRules": [
+          { "field": "contentType", "condition": "equals", "value": "text", "thenShow": ["textContent"] },
+          { "field": "contentType", "condition": "equals", "value": "image-url", "thenShow": ["imageUrl"] }
+        ]
       }
     }
   ]
 }
 ```
+
+#### Component Config Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `refreshable` | boolean | Show refresh button on card |
+| `refreshInterval` | number | Auto-refresh interval in ms |
+| `hasDataSource` | boolean | Enable Data Source tab in config dialog |
+| `dataSourceAllowedTypes` | string[] | Allowed data source types: `"device"`, `"device-metric"`, `"extension"`, `"extension-command"`, `"system"`, `"ai-metric"`, `"transform"` |
+| `configSchema` | object | Form fields for config dialog |
+| `uiHints` | object | UI behavior hints for config form |
+
+#### configSchema Field Properties
+
+Each field in `configSchema` supports:
+- `type`: `"string"`, `"number"`, `"integer"`, `"boolean"`
+- `title`: Display label (shown as field label)
+- `description`: Help text / placeholder
+- `default`: Default value
+- `enum`: Array of allowed values → renders as dropdown select
+- `enumTitles`: Display labels for enum values (parallel array)
+
+#### uiHints (Conditional Field Visibility)
+
+```json
+"uiHints": {
+  "fieldOrder": ["field1", "field2", "field3"],
+  "visibilityRules": [
+    {
+      "field": "controlField",
+      "condition": "equals",
+      "value": "someValue",
+      "thenShow": ["dependentField1", "dependentField2"]
+    }
+  ]
+}
+```
+
+**Supported conditions:** `equals`, `not_equals`, `contains`, `empty`, `not_empty`
+
+**Behavior:** Fields listed in `thenShow` are **hidden by default**, and only shown when the rule matches. Fields NOT in any `thenShow` rule are always visible.
+
+#### Data Source Binding
+
+When `hasDataSource: true`, the config dialog shows a Data Source tab. The bound data source is passed to the component as `props.dataSource`:
+
+```typescript
+export interface ExtensionComponentProps {
+  dataSource?: {
+    type: string
+    deviceId?: string
+    device_id?: string
+    extensionId?: string
+    command?: string
+    [key: string]: any
+  }
+  config?: Record<string, any>
+  className?: string
+}
+```
+
+Use `dataSourceAllowedTypes` to control what types users can select:
+- `["device"]` — only device selection (for device-targeting components)
+- `["device-metric", "extension"]` — metric and extension data
+- Default (unset): `["device-metric", "extension", "extension-command"]`
 
 ## JSON File Generation
 
@@ -259,23 +395,7 @@ int _neomind_extension_shutdown();
 
 ## Release Process
 
-1. **Update versions:**
-   ```bash
-   ./scripts/update-versions.sh 2.4.0
-   git add . && git commit -m "chore: bump to v2.4.0"
-   ```
-
-2. **Build packages:**
-   ```bash
-   ./release.sh  # or ./build-all-platforms.sh
-   ```
-
-3. **Create GitHub release:**
-   ```bash
-   git tag v2.4.0
-   git push origin main --tags
-   gh release create v2.4.0 ./dist/*.nep --title "v2.4.0"
-   ```
+> 详细发布步骤和版本规范见上方 [Release Process](#release-process-1) 章节。
 
 ## Important Rules
 
@@ -289,9 +409,20 @@ int _neomind_extension_shutdown();
 - This enables safe extension unloading and panic recovery
 
 ### Frontend Components
+
+> **完整设计规范：** [`EXTENSION_FRONTEND_DESIGN_GUIDE.md`](EXTENSION_FRONTEND_DESIGN_GUIDE.md) — 修改扩展前端前必须阅读。
+
+Key rules:
 - Build to UMD format (`.umd.cjs`) for browser compatibility
+- React/ReactDOM are external — provided by host app, NOT bundled
+- **NEVER use Tailwind CSS** — extensions don't have Tailwind. Use NeoMind CSS variables (`var(--foreground)`, `var(--card)`, etc.) for all colors
+- **NEVER hardcode colors** (`#fff`, `rgb(...)`) — use CSS variables for automatic light/dark mode support
+- **主按钮文本必须用 `var(--{prefix}-on-primary)`**，不能直接写 `var(--primary-foreground)` 或 `#fff` — 详见设计规范第 5.1 节
 - Component names in `index.json` must be string array, not objects
 - Entry point file must match `frontend.json` entrypoint
+- Every component must use `forwardRef` and handle loading/error/empty states
+- Use scoped CSS with extension-prefixed class names (e.g., `.weather-`, `.yolo-`)
+- Use inline SVG icons, not icon libraries
 
 ### CDN Caching
 - Main project uses timestamp-based cache-busting (`?t=timestamp`)
@@ -345,7 +476,9 @@ npm run build
 
 ## Documentation
 
+- **`EXTENSION_FRONTEND_DESIGN_GUIDE.md`** - Extension 前端设计规范（CSS 变量、组件模板、暗色模式、fallback 模式）
 - `EXTENSION_GUIDE.md` - Detailed extension development guide
 - `EXTENSION_GUIDE.zh.md` - Chinese version
 - `QUICKSTART.md` - Quick start guide
 - `DEPLOYMENT.md` - Deployment documentation
+- **NeoMind Design Spec**: `../NeoMind/web/DESIGN_SPEC.md` - Main platform design system

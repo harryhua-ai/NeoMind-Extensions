@@ -25,7 +25,7 @@ use neomind_extension_sdk::capabilities::CapabilityContext;
 use neomind_extension_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::collections::HashMap;
 use base64::Engine;
 use parking_lot::{Mutex, RwLock};
@@ -301,6 +301,8 @@ fn draw_detections_on_image(
 fn setup_native_lib_paths() {
     let lib_env = if cfg!(target_os = "macos") {
         "DYLD_LIBRARY_PATH"
+    } else if cfg!(target_os = "windows") {
+        "PATH"
     } else {
         "LD_LIBRARY_PATH"
     };
@@ -385,7 +387,8 @@ fn setup_native_lib_paths() {
     }
 
     if !paths.is_empty() {
-        let combined = paths.join(":");
+        let sep = if cfg!(target_os = "windows") { ";" } else { ":" };
+        let combined = paths.join(sep);
         tracing::info!("[NativeLibs] Setting {} = {}", lib_env, combined);
         std::env::set_var(lib_env, &combined);
     }
@@ -547,6 +550,11 @@ pub struct YoloDeviceInference {
     /// YOLO model runtime (native only) - lazy-loading wrapper
     #[cfg(not(target_arch = "wasm32"))]
     detector: Mutex<YOLODetector>,
+    /// Model load state mirrored as atomics so get_status/get_model_status never blocks on detector mutex
+    #[cfg(not(target_arch = "wasm32"))]
+    model_loaded: AtomicBool,
+    #[cfg(not(target_arch = "wasm32"))]
+    model_error: parking_lot::Mutex<Option<String>>,
 
     /// Device bindings: device_id -> binding
     bindings: Arc<RwLock<HashMap<String, DeviceBinding>>>,
@@ -575,6 +583,10 @@ impl YoloDeviceInference {
         Self {
             #[cfg(not(target_arch = "wasm32"))]
             detector: Mutex::new(YOLODetector::new(0.25, 0.45, "v8", "n")),
+            #[cfg(not(target_arch = "wasm32"))]
+            model_loaded: AtomicBool::new(false),
+            #[cfg(not(target_arch = "wasm32"))]
+            model_error: parking_lot::Mutex::new(None),
             bindings: Arc::new(RwLock::new(HashMap::new())),
             binding_stats: Arc::new(RwLock::new(HashMap::new())),
             total_inferences: Arc::new(AtomicU64::new(0)),
@@ -633,6 +645,13 @@ impl YoloDeviceInference {
         *detector = YOLODetector::new(conf, 0.45, version, scale);
         detector.ensure_loaded();
 
+        // Sync model state to atomics
+        self.model_loaded.store(detector.model.is_some(), Ordering::Relaxed);
+        {
+            let mut err_guard = self.model_error.lock();
+            *err_guard = detector.load_error.clone();
+        }
+
         if detector.model.is_some() {
             Ok(())
         } else {
@@ -643,11 +662,11 @@ impl YoloDeviceInference {
     /// Get model status
     #[cfg(not(target_arch = "wasm32"))]
     pub fn get_model_status(&self) -> serde_json::Value {
-        let mut detector = self.detector.lock();
-        detector.ensure_loaded();
+        let model_loaded = self.model_loaded.load(Ordering::Relaxed);
+        let model_error = self.model_error.lock().clone();
         json!({
-            "loaded": detector.model.is_some(),
-            "error": detector.load_error,
+            "loaded": model_loaded,
+            "error": model_error,
             "confidence_threshold": *self.default_confidence.lock(),
             "model_version": self.model_version.lock().clone(),
         })
@@ -752,6 +771,12 @@ impl YoloDeviceInference {
         {
             let mut detector = self.detector.lock();
             detector.ensure_loaded();
+            // Sync model state to atomics so get_status stays accurate without locking detector
+            self.model_loaded.store(detector.model.is_some(), Ordering::Relaxed);
+            {
+                let mut err_guard = self.model_error.lock();
+                *err_guard = detector.load_error.clone();
+            }
             if detector.model.is_none() {
                 let err = detector.load_error.clone()
                     .unwrap_or_else(|| "Model not loaded".to_string());
@@ -901,11 +926,9 @@ impl YoloDeviceInference {
     pub fn get_status(&self) -> serde_json::Value {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            // Trigger lazy loading to get accurate model status
-            let mut detector = self.detector.lock();
-            detector.ensure_loaded();
-            let model_loaded = detector.model.is_some();
-            let model_error = detector.load_error.clone();
+            // Read model state from atomics — never blocks on detector mutex
+            let model_loaded = self.model_loaded.load(Ordering::Relaxed);
+            let model_error = self.model_error.lock().clone();
 
             json!({
                 "model_loaded": model_loaded,
@@ -1835,6 +1858,10 @@ impl Extension for YoloDeviceInference {
             "get_config" => {
                 Ok(serde_json::to_value(&self.get_config())
                     .map_err(|e| ExtensionError::ExecutionFailed(format!("Serialization error: {}", e)))?)
+            }
+            "configure" => {
+                // Accept config silently - can be extended for real config handling
+                Ok(json!({"status": "ok"}))
             }
             _ => Err(ExtensionError::CommandNotFound(command.to_string())),
         }
