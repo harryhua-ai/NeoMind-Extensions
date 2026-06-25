@@ -27,8 +27,15 @@ This repository contains officially maintained extensions for the **NeoMind exte
 | YOLO Device Inference | `yolo-device-inference` | AI/ML | DeviceBindingCard | Auto YOLO detection on device camera feeds |
 | Face Recognition | `face-recognition` | AI/ML | FaceRecognitionCard | ArcFace face recognition with gallery management |
 | OCR Device Inference | `ocr-device-inference` | AI/ML | OcrDeviceCard | PP-OCRv4 text recognition on device images |
+| Locate Anything V2 | `locate-anything-v2` | AI/ML | LocateCard | Visual grounding — object detection, phrase grounding, OCR via LocateAnything-3B |
 | Stream Player | `stream-player` | Media | StreamPlayerCard | RTSP/RTMP/HLS video player via FFmpeg |
 | Uink-RMS Bridge | `uink-rms-bridge` | Device | DisplayEditorCard | E-paper display content push & management |
+| Home Assistant Bridge | `homeassistant-bridge` | IoT Bridge | — | Bidirectional HA entity sync via REST/WebSocket |
+| LoRaWAN Bridge | `lorawan-bridge` | IoT Bridge | — | LoRaWAN NS (ChirpStack/TTN) MQTT bridge with payload decoding |
+| Modbus Bridge | `modbus-bridge` | IoT Bridge | — | Modbus TCP/RTU device polling and register read/write |
+| BACnet Bridge | `bacnet-bridge` | IoT Bridge | — | BACnet/IP building automation — device discovery, sensor reading, COV subscriptions |
+| ONVIF Bridge | `onvif-bridge` | IoT Bridge | — | ONVIF IP camera discovery, RTSP streaming, PTZ control |
+| OPC-UA Bridge | `opcua-bridge` | IoT Bridge | — | OPC-UA server connection, node browsing, data subscriptions |
 | WASM Demo | `wasm-demo` | Demo | — | Counter demo for WASM target |
 
 > **Latest Release**: See [GitHub Releases](https://github.com/camthink-ai/NeoMind-Extensions/releases)
@@ -134,8 +141,15 @@ NeoMind-Extensions/
 │   ├── yolo-device-inference/
 │   ├── face-recognition/
 │   ├── ocr-device-inference/
+│   ├── locate-anything-v2/
 │   ├── stream-player/
 │   ├── uink-rms-bridge/
+│   ├── homeassistant-bridge/
+│   ├── lorawan-bridge/
+│   ├── modbus-bridge/
+│   ├── bacnet-bridge/
+│   ├── onvif-bridge/
+│   ├── opcua-bridge/
 │   ├── wasm-demo/
 │   └── index.json               # Marketplace index (auto-generated)
 ├── scripts/

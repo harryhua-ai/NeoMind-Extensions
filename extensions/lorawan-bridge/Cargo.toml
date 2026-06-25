@@ -1,0 +1,34 @@
+[package]
+name = "lorawan-bridge"
+version = "2.7.6"
+edition = "2021"
+authors = ["NeoMind Team"]
+license = "Apache-2.0"
+description = "LoRaWAN bridge extension for NeoMind — connect ChirpStack/TTN sensors with auto-discovery"
+
+[lib]
+name = "neomind_extension_lorawan_bridge"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+neomind-extension-sdk = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = "0.1"
+chrono = "0.4"
+hex = "0.4"
+base64 = "0.22"
+rumqttc = { version = "0.25", features = ["use-rustls"] }
+ureq = { version = "3", features = ["json"] }
+tokio = { version = "1", features = ["rt", "sync"] }
+parking_lot = "0.12"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "net", "macros", "time", "io-util"] }
+base64 = "0.22"
+
+[features]
+default = []
+native = []
+wasm = []

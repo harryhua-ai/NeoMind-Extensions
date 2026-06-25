@@ -156,6 +156,13 @@ V2_EXTENSIONS=(
     "stream-player"
     "wasm-demo"
     "uink-rms-bridge"
+    "homeassistant-bridge"
+    "lorawan-bridge"
+    "modbus-bridge"
+    "bacnet-bridge"
+    "onvif-bridge"
+    "opcua-bridge"
+    "locate-anything-v2"
 )
 
 # Filter to single extension if specified
@@ -417,6 +424,7 @@ if [ "$SKIP_PACKAGE" = false ] && [ "$BUILD_TYPE" = "release" ]; then
 
             if [ -n "$ORT_LIB" ] && [ -f "$ORT_LIB" ]; then
                 cp "$ORT_LIB" "$BINARY_DIR/"
+                chmod +x "$BINARY_DIR/$(basename $ORT_LIB)"
                 echo -e "    ${GREEN}→${NC} Bundled ONNX Runtime: $(basename $ORT_LIB)"
 
                 # Verify architecture matches the target platform
@@ -439,51 +447,62 @@ if [ "$SKIP_PACKAGE" = false ] && [ "$BUILD_TYPE" = "release" ]; then
         fi
 
         # Bundle dependency DLLs for Windows (FFmpeg, etc.)
-        # Windows doesn't have otool/LD_LIBRARY_PATH, so we search FFMPEG_DIR for DLLs
+        # Copy ALL DLLs from FFMPEG_DIR/bin to cover transitive dependencies.
+        # BtbN FFmpeg shared builds have codec DLLs (libx264-164.dll, libx265-209.dll, etc.)
+        # that avcodec-61.dll depends on at load time. A curated list always misses some.
         if [ "$IS_WASM" = false ] && [ "$LIB_EXT" = "dll" ]; then
             echo -e "    ${BLUE}→${NC} Bundling Windows dependency DLLs (FFMPEG_DIR=$FFMPEG_DIR)..."
 
             BINARY_DIR="$PACKAGE_DIR/binaries/$PLATFORM"
-
-            # Collect DLL search paths
-            DLL_SEARCH_DIRS=""
-            if [ -n "$FFMPEG_DIR" ] && [ -d "$FFMPEG_DIR/bin" ]; then
-                DLL_SEARCH_DIRS="$DLL_SEARCH_DIRS $FFMPEG_DIR/bin"
-            fi
-            if [ -n "$FFMPEG_DIR" ] && [ -d "$FFMPEG_DIR/lib" ]; then
-                DLL_SEARCH_DIRS="$DLL_SEARCH_DIRS $FFMPEG_DIR/lib"
-            fi
-
-            # Common DLLs needed by extensions (FFmpeg, etc.)
-            # BtbN FFmpeg shared builds use hyphenated names: avcodec-61.dll, avformat-61.dll, etc.
-            REQUIRED_DLLS="avcodec avformat avutil swscale swresample avdevice avfilter
-                x264 x265 vpx opus vorbis ogg speex soxr
-                srt ssh rist zmq sodium
-                ssl crypto gmp hogtle nettle
-                brotlicommon brotlidec brotlienc
-                zstd lzma png jpeg webp sharpyuv
-                fontconfig freetype fribidi
-                unistring idn2 intl tasn1 p11-kit gnutls
-                bluray aom dav1d rav1e jxl jxl_cms jxl_threads snappy
-                openjp2 mp3lame vmaf theora theoraenc theoradec"
-
             BUNDLED_COUNT=0
-            for dll_name in $REQUIRED_DLLS; do
-                # Skip if already bundled (e.g., onnxruntime.dll was copied above)
-                if ls "$BINARY_DIR"/${dll_name}*.dll 2>/dev/null | head -1 | grep -q .; then
-                    continue
-                fi
 
-                # Search for DLL in known directories
-                for search_dir in $DLL_SEARCH_DIRS; do
-                    FOUND_DLL=$(find "$search_dir" -maxdepth 1 -name "${dll_name}*.dll" 2>/dev/null | head -1)
-                    if [ -n "$FOUND_DLL" ] && [ -f "$FOUND_DLL" ]; then
-                        cp "$FOUND_DLL" "$BINARY_DIR/" || true
-                        BUNDLED_COUNT=$((BUNDLED_COUNT + 1))
-                        echo -e "      ${GREEN}→${NC} $(basename $FOUND_DLL)"
-                        break
-                    fi
+            # Copy all DLLs from FFMPEG_DIR/bin (covers FFmpeg + all codec dependencies)
+            if [ -n "$FFMPEG_DIR" ] && [ -d "$FFMPEG_DIR/bin" ]; then
+                for dll in "$FFMPEG_DIR/bin"/*.dll; do
+                    [ -f "$dll" ] || continue
+                    dll_name=$(basename "$dll")
+                    # Skip if already bundled (e.g., onnxruntime.dll was copied above)
+                    [ -f "$BINARY_DIR/$dll_name" ] && continue
+                    cp "$dll" "$BINARY_DIR/" || true
+                    BUNDLED_COUNT=$((BUNDLED_COUNT + 1))
+                    echo -e "      ${GREEN}→${NC} $dll_name"
                 done
+            fi
+
+            # Also copy from FFMPEG_DIR/lib if it exists (some distributions put DLLs there)
+            if [ -n "$FFMPEG_DIR" ] && [ -d "$FFMPEG_DIR/lib" ]; then
+                for dll in "$FFMPEG_DIR/lib"/*.dll; do
+                    [ -f "$dll" ] || continue
+                    dll_name=$(basename "$dll")
+                    [ -f "$BINARY_DIR/$dll_name" ] && continue
+                    cp "$dll" "$BINARY_DIR/" || true
+                    BUNDLED_COUNT=$((BUNDLED_COUNT + 1))
+                    echo -e "      ${GREEN}→${NC} $dll_name"
+                done
+            fi
+
+            # Bundle MSVC runtime DLLs (VCRUNTIME140.dll etc.)
+            # Rust cdylib compiled with MSVC links against vcruntime140.dll.
+            # Not all Windows machines have the Visual C++ Redistributable installed.
+            # Search common locations for these DLLs.
+            VCRUNTIME_DLLS="vcruntime140 vcruntime140_1 msvcp140"
+            for vcruntime_name in $VCRUNTIME_DLLS; do
+                [ -f "$BINARY_DIR/${vcruntime_name}.dll" ] && continue
+                FOUND_VCRT=""
+                # Search in System32 (always present on Windows 10+)
+                if [ -f "/c/Windows/System32/${vcruntime_name}.dll" ]; then
+                    FOUND_VCRT="/c/Windows/System32/${vcruntime_name}.dll"
+                elif [ -f "$SYSTEMROOT/System32/${vcruntime_name}.dll" ]; then
+                    FOUND_VCRT="$SYSTEMROOT/System32/${vcruntime_name}.dll"
+                # Also try the Rust toolchain's DLL directory
+                elif [ -n "$RUSTUP_HOME" ]; then
+                    FOUND_VCRT=$(find "$RUSTUP_HOME/toolchains" -name "${vcruntime_name}.dll" 2>/dev/null | head -1)
+                fi
+                if [ -n "$FOUND_VCRT" ] && [ -f "$FOUND_VCRT" ]; then
+                    cp "$FOUND_VCRT" "$BINARY_DIR/" || true
+                    BUNDLED_COUNT=$((BUNDLED_COUNT + 1))
+                    echo -e "      ${GREEN}→${NC} ${vcruntime_name}.dll (MSVC runtime)"
+                fi
             done
 
             if [ $BUNDLED_COUNT -gt 0 ]; then
@@ -1054,6 +1073,9 @@ if [ "$SKIP_PACKAGE" = false ] && [ "$BUILD_TYPE" = "release" ]; then
 
         cd "$PACKAGE_DIR"
 
+        # Ensure all shared libraries have execute permission (required on Linux)
+        find . -name "*.so*" -o -name "*.dylib" | xargs chmod +x 2>/dev/null || true
+
         # Export output path for Python script (avoids shell string escaping issues)
         export NEOMIND_OUTPUT_ABS="$OUTPUT_ABS"
 
@@ -1061,12 +1083,18 @@ if [ "$SKIP_PACKAGE" = false ] && [ "$BUILD_TYPE" = "release" ]; then
         # macOS zip command has a known bug producing incorrect CRC32 for large files
         if command -v python3 &> /dev/null; then
             python3 << 'PYEOF'
-import zipfile, os, sys
+import zipfile, os, stat, sys
 
 output = os.path.normpath(os.environ.get('NEOMIND_OUTPUT_ABS', ''))
 if not output:
     print("ERROR: NEOMIND_OUTPUT_ABS not set", file=sys.stderr)
     sys.exit(1)
+
+def make_external_attr(filepath, is_dir=False):
+    """Preserve Unix permissions in zip external_attr so unzip restores execute bits."""
+    mode = os.stat(filepath).st_mode
+    # external_attr layout: MSB = Unix permissions << 16
+    return (mode & 0xFFFF) << 16
 
 os.makedirs(os.path.dirname(output), exist_ok=True)
 with zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED) as zf:
@@ -1075,9 +1103,15 @@ with zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED) as zf:
             fp = os.path.join(root, f)
             arcname = fp[2:]  # strip './'
             if os.path.isdir(fp):
-                zf.write(fp, arcname + '/')
+                info = zipfile.ZipInfo.from_file(fp, arcname + '/')
+                info.external_attr = make_external_attr(fp, is_dir=True)
+                zf.writestr(info, b'')
             else:
-                zf.write(fp, arcname)
+                info = zipfile.ZipInfo.from_file(fp, arcname)
+                info.external_attr = make_external_attr(fp)
+                info.compress_type = zipfile.ZIP_DEFLATED
+                with open(fp, 'rb') as fh:
+                    zf.writestr(info, fh.read())
 # Verify
 with zipfile.ZipFile(output, 'r') as zf:
     bad = zf.testzip()
@@ -1115,6 +1149,52 @@ PYEOF
 
     echo ""
     echo -e "${GREEN}Packages created in dist/${NC}"
+
+    # === Windows DLL Dependency Diagnostic ===
+    # Use PowerShell to call dumpbin (not on PATH in Git Bash)
+    if [ "$LIB_EXT" = "dll" ]; then
+        echo ""
+        echo -e "${BLUE}=== Windows DLL Dependency Diagnostic ===${NC}"
+        for nep in dist/*.nep; do
+            [ -f "$nep" ] || continue
+            ext_name=$(basename "$nep" | sed 's/-[0-9].*//')
+            echo -e "  ${BLUE}--- $ext_name ---${NC}"
+
+            # Extract to temp dir
+            tmp_dir=$(mktemp -d)
+            unzip -q -o "$nep" -d "$tmp_dir" 2>/dev/null || continue
+
+            # Find extension DLL (skip known dependency DLLs)
+            ext_dll=$(find "$tmp_dir/binaries" -name "*.dll" ! -name "avcodec*" ! -name "avformat*" ! -name "avutil*" ! -name "swscale*" ! -name "swresample*" ! -name "avdevice*" ! -name "avfilter*" ! -name "onnxruntime*" 2>/dev/null | head -1)
+
+            if [ -n "$ext_dll" ]; then
+                echo "  Extension: $(basename "$ext_dll")"
+                # Use PowerShell to run dumpbin
+                pwsh -NoProfile -Command "
+                    \$dll = '$ext_dll' -replace '\\\\','/'
+                    # Try dumpbin first
+                    \$dumpbin = Get-ChildItem 'C:\Program Files*\Microsoft Visual Studio\*\*\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+                    if (\$dumpbin) {
+                        Write-Host '  DLL Dependencies (dumpbin):'
+                        & \$dumpbin.FullName /dependents \$dll 2>&1 | Select-String '\.dll$' | ForEach-Object { Write-Host \"    \$(\$_.Line.Trim())\" }
+                    } else {
+                        # Fallback: use objdump from MinGW or strings
+                        Write-Host '  DLL Dependencies (strings fallback):'
+                        # Extract DLL names from the PE import table
+                        \$bytes = [System.IO.File]::ReadAllBytes(\$dll)
+                        \$text = [System.Text.Encoding]::ASCII.GetString(\$bytes)
+                        \$matches = [regex]::Matches(\$text, '[\w-]+\.dll')
+                        \$matches | ForEach-Object { \$_.Value } | Sort-Object -Unique | ForEach-Object { Write-Host \"    \$_\" }
+                    }
+                " 2>/dev/null
+                echo "  Bundled DLLs:"
+                find "$tmp_dir/binaries" -name "*.dll" -exec basename {} \; | sort | sed 's/^/    /'
+            fi
+
+            rm -rf "$tmp_dir"
+        done
+        echo -e "${BLUE}=== End DLL Diagnostic ===${NC}"
+    fi
 fi
 
 echo ""
@@ -1155,6 +1235,11 @@ if [ "$AUTO_INSTALL" = true ]; then
             fi
             if [ -f "$LIB_FILE" ]; then
                 cp "$LIB_FILE" "$EXT_INSTALL_DIR/binaries/$PLATFORM/extension.${LIB_EXT}"
+                # Fix dylib install name on macOS
+                if [ "$LIB_EXT" = "dylib" ]; then
+                    install_name_tool -id '@rpath/extension.dylib' "$EXT_INSTALL_DIR/binaries/$PLATFORM/extension.dylib" 2>/dev/null || true
+                    codesign --force --sign - "$EXT_INSTALL_DIR/binaries/$PLATFORM/extension.dylib" 2>/dev/null || true
+                fi
             fi
 
             # Copy frontend bundle
@@ -1389,6 +1474,19 @@ if [ "$AUTO_INSTALL" = true ]; then
     echo ""
     echo -e "${GREEN}Installation complete!${NC}"
     echo "Extensions installed to: $INSTALL_DIR"
+
+    # Also install to Tauri data directory on macOS (if it exists)
+    TAURI_DATA_DIR="$HOME/Library/Application Support/com.neomind.neomind/data/extensions"
+    if [ "$(uname)" = "Darwin" ] && [ -d "$TAURI_DATA_DIR" ]; then
+        echo ""
+        echo -e "${BLUE}Syncing to Tauri data directory...${NC}"
+        for ext in "${BUILT_EXTENSIONS[@]}"; do
+            if [ -d "$INSTALL_DIR/$ext" ] && [ -d "$TAURI_DATA_DIR/$ext" ]; then
+                cp -R "$INSTALL_DIR/$ext/"* "$TAURI_DATA_DIR/$ext/" 2>/dev/null || true
+                echo -e "  ${GREEN}✓${NC} Synced $ext to Tauri data dir"
+            fi
+        done
+    fi
 else
     echo ""
     echo -e "${YELLOW}To install extensions, run:${NC}"
@@ -1397,3 +1495,4 @@ else
     echo "Or use the .nep packages:"
     echo "  NeoMind Web UI → Extensions → Add Extension → File Mode"
 fi
+# force CI

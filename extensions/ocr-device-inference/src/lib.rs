@@ -32,14 +32,115 @@ use chrono::Utc;
 use base64::Engine;
 
 /// Auto-detect best available inference device.
-/// macOS → CoreML, Linux → CUDA, others → CPU.
+/// macOS → CoreML, Linux → CUDA (only if sufficient address space), others → CPU.
 fn auto_device() -> usls::Device {
     #[cfg(target_os = "macos")]
     { usls::Device::CoreMl }
     #[cfg(all(not(target_os = "macos"), target_os = "linux"))]
-    { usls::Device::Cuda(0) }
+    {
+        // CUDA EP initialization hangs in memory-constrained environments
+        // (even with RLIMIT_AS raised to 4096MB). Only use CUDA when address
+        // space is plentiful (unlimited or >=8GB).
+        // The extension runner sets soft=2048MB hard=4096MB — we raise soft
+        // to hard for model loading but use CPU for inference.
+        let rlimit_mb = get_rlimit_as_mb();
+        if rlimit_mb <= 4096 {
+            eprintln!("[HW] RLIMIT_AS is {}MB (memory-constrained), using CPU", rlimit_mb);
+            return usls::Device::Cpu(0);
+        }
+
+        // Only use CUDA when address space is plentiful (e.g., unlimited or >=8GB)
+        let free_gpu_mb = get_gpu_free_memory_mb();
+        if free_gpu_mb >= 2048 {
+            eprintln!("[HW] GPU free: {}MB, RLIMIT_AS: {}MB, using CUDA", free_gpu_mb, rlimit_mb);
+            usls::Device::Cuda(0)
+        } else {
+            eprintln!("[HW] GPU free: {}MB (insufficient), using CPU", free_gpu_mb);
+            usls::Device::Cpu(0)
+        }
+    }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     { usls::Device::Cpu(0) }
+}
+
+/// Get current RLIMIT_AS in MiB by reading /proc/self/limits (0 = unlimited or error)
+#[cfg(target_os = "linux")]
+fn get_rlimit_as_mb() -> u64 {
+    get_rlimit_as().map(|(soft, _)| soft / 1024 / 1024).unwrap_or(u64::MAX)
+}
+
+/// Get RLIMIT_AS (soft, hard) in bytes by reading /proc/self/limits.
+/// Returns None if the file can't be parsed.
+#[cfg(target_os = "linux")]
+fn get_rlimit_as() -> Option<(u64, u64)> {
+    let contents = std::fs::read_to_string("/proc/self/limits").ok()?;
+    for line in contents.lines() {
+        if line.contains("address space") {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            // Format: "Max address space  2147483648  4294967296  bytes"
+            // parts: ["Max", "address", "space", "2147483648", "4294967296", "bytes"]
+            if parts.len() >= 5 {
+                let soft = parts[3].parse::<u64>().ok()?;
+                let hard = parts[4].parse::<u64>().ok()?;
+                return Some((soft, hard));
+            }
+        }
+    }
+    None
+}
+
+/// Raise RLIMIT_AS soft limit to the given value using inline syscall.
+/// On x86_64 Linux, setrlimit syscall number is 160. RLIMIT_AS = 9.
+/// A process can always raise its own soft limit up to the hard limit.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn raise_rlimit_as(new_soft: u64) {
+    // struct rlimit { rlim_cur: u64, rlim_max: u64 } — 16 bytes
+    let mut rlim = [0u64; 2];
+    rlim[0] = new_soft; // rlim_cur
+    rlim[1] = new_soft; // rlim_max
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") 160u64,        // __NR_setrlimit
+            in("rdi") 9u64,          // RLIMIT_AS
+            in("rsi") rlim.as_ptr(),
+            lateout("rax") ret,
+            out("rcx") _,
+            out("r11") _,
+        );
+    }
+    if ret == 0 {
+        eprintln!("[NativeLibs] Raised RLIMIT_AS to {}MB", new_soft / 1024 / 1024);
+    } else {
+        eprintln!("[NativeLibs] setrlimit failed (errno={})", -ret);
+    }
+}
+
+#[cfg(all(target_os = "linux", not(target_arch = "x86_64")))]
+fn raise_rlimit_as(_new_soft: u64) {
+    eprintln!("[NativeLibs] raise_rlimit_as: unsupported architecture");
+}
+
+/// Query free GPU memory in MiB via nvidia-smi
+#[cfg(target_os = "linux")]
+fn get_gpu_free_memory_mb() -> u64 {
+    use std::process::Command;
+    match Command::new("nvidia-smi")
+        .args(["--query-gpu=memory.free", "--format=csv,noheader,nounits"])
+        .output()
+    {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if let Some(line) = stdout.lines().next() {
+                if let Ok(mb) = line.trim().parse::<u64>() {
+                    return mb;
+                }
+            }
+        }
+        Err(_) => {}
+    }
+    0
 }
 
 /// Try building a model with the auto-detected device, fall back to CPU on failure.
@@ -54,8 +155,8 @@ where
             eprintln!("[HW] Model loaded with device: {:?}", device);
             Ok(model)
         }
-        Err(_) if !matches!(device, usls::Device::Cpu(_)) => {
-            eprintln!("[HW] {:?} failed, falling back to CPU", device);
+        Err(ref e) if !matches!(device, usls::Device::Cpu(_)) => {
+            eprintln!("[HW] {:?} failed, falling back to CPU: {}", device, e);
             try_build(usls::Device::Cpu(0))
         }
         Err(e) => Err(e),
@@ -193,6 +294,8 @@ pub struct TextBlock {
     pub text: String,
     pub confidence: f32,
     pub bbox: BoundingBox,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub polygon: Option<Vec<[f32; 2]>>,
 }
 
 /// OCR inference result
@@ -242,6 +345,19 @@ struct OcrConfig {
 /// Checks NEOMIND_EXTENSION_DIR/lib/ and common system paths.
 #[cfg(not(target_arch = "wasm32"))]
 fn setup_native_lib_paths() {
+    // Raise RLIMIT_AS soft limit to match hard limit.
+    // The extension runner sets soft=2048MB hard=4096MB. Three OCR models need
+    // ~2.1GB virtual address space, so the default 2048MB soft limit is too low.
+    // A process can always raise its own soft limit to the hard limit (no root needed).
+    #[cfg(target_os = "linux")]
+    {
+        if let Some((_soft, hard)) = get_rlimit_as() {
+            if hard > 0 {
+                raise_rlimit_as(hard);
+            }
+        }
+    }
+
     let lib_env = if cfg!(target_os = "macos") {
         "DYLD_LIBRARY_PATH"
     } else if cfg!(target_os = "windows") {
@@ -275,30 +391,35 @@ fn setup_native_lib_paths() {
                         paths.push(path.to_string_lossy().to_string());
 
                         // Create unversioned symlinks for versioned libraries
-                        // e.g. libonnxruntime.1.19.2.dylib -> libonnxruntime.dylib
+                        // e.g. libonnxruntime.so.1 -> libonnxruntime.so
+                        //      libonnxruntime.1.19.2.dylib -> libonnxruntime.dylib
                         if let Ok(files) = std::fs::read_dir(&path) {
                             for file in files.flatten() {
                                 let file_path = file.path();
                                 let name = file_path.file_name().unwrap_or_default().to_string_lossy();
-                                // Match versioned dylib/so patterns
-                                if let Some(base) = name.strip_suffix(".dylib")
-                                    .or_else(|| name.strip_suffix(".so"))
-                                {
-                                    if base.contains('.') {
-                                        // Has version suffix like libonnxruntime.1.19.2
-                                        let unversioned = if cfg!(target_os = "macos") {
-                                            format!("{}.dylib", base.split('.').next().unwrap_or(base))
-                                        } else {
-                                            format!("{}.so", base.split('.').next().unwrap_or(base))
-                                        };
-                                        let link_path = path.join(&unversioned);
-                                        if !link_path.exists() {
-                                            #[cfg(unix)]
-                                            let _ = std::os::unix::fs::symlink(&file_path, &link_path);
-                                            #[cfg(not(unix))]
-                                            let _ = ();
-                                            tracing::info!("[NativeLibs] Created symlink: {} -> {}", unversioned, name);
-                                        }
+                                let unversioned = if cfg!(target_os = "macos") {
+                                    name.strip_suffix(".dylib").and_then(|base| {
+                                        let parts: Vec<&str> = base.split('.').collect();
+                                        if parts.len() > 1 { Some(format!("{}.dylib", parts[0])) } else { None }
+                                    })
+                                } else if cfg!(target_os = "windows") {
+                                    None
+                                } else {
+                                    // Linux: libfoo.so.1 -> libfoo.so
+                                    if let Some(idx) = name.find(".so.") {
+                                        Some(format!("{}.so", &name[..idx]))
+                                    } else {
+                                        None
+                                    }
+                                };
+                                if let Some(unversioned) = unversioned {
+                                    let link_path = path.join(&unversioned);
+                                    if !link_path.exists() {
+                                        #[cfg(unix)]
+                                        let _ = std::os::unix::fs::symlink(&file_path, &link_path);
+                                        #[cfg(not(unix))]
+                                        let _ = ();
+                                        tracing::info!("[NativeLibs] Created symlink: {} -> {}", unversioned, name);
                                     }
                                 }
                             }
@@ -597,7 +718,8 @@ impl OcrEngine {
         };
 
         // Collect cropped images and their bounding boxes first (before borrowing recognizer)
-        let mut crops_with_bboxes: Vec<(usls::Image, BoundingBox)> = Vec::new();
+        // Also carry normalized polygon coords so the precise contour can be emitted alongside bbox.
+        let mut crops_with_data: Vec<(usls::Image, BoundingBox, Option<Vec<[f32; 2]>>)> = Vec::new();
 
         if let Some(det_result) = det_results.first() {
             tracing::info!("[OcrDeviceInference] Detection found {} polygons", det_result.polygons.len());
@@ -605,62 +727,87 @@ impl OcrEngine {
                 let cropped = Self::crop_polygon_static(&img, polygon);
                 if let Some(crop_img) = cropped {
                     let bbox = Self::polygon_to_bbox_static(polygon, img_width, img_height);
-                    crops_with_bboxes.push((crop_img, bbox));
+                    let poly_coords = Some(
+                        polygon.points().iter()
+                            .map(|p| [p[0] / img_width as f32, p[1] / img_height as f32])
+                            .collect()
+                    );
+                    crops_with_data.push((crop_img, bbox, poly_coords));
                 }
             }
         } else {
             tracing::warn!("[OcrDeviceInference] Detection returned no results");
         }
 
-        tracing::info!("[OcrDeviceInference] Created {} crops for recognition", crops_with_bboxes.len());
+        tracing::info!("[OcrDeviceInference] Created {} crops for recognition", crops_with_data.len());
 
-        // Now recognize all cropped images
+        // Batch recognition: process all crops in one forward pass instead of one-by-one
         let mut text_blocks = Vec::new();
         let mut all_texts = Vec::new();
         let mut total_confidence = 0.0;
 
-        for (crop_img, bbox) in crops_with_bboxes {
-            // Recognize text using the selected recognizer
+        if !crops_with_data.is_empty() {
+            // Separate crops, bboxes and polygons for batch processing
+            let bboxes: Vec<BoundingBox> = crops_with_data.iter().map(|(_, b, _)| b.clone()).collect();
+            let polygons: Vec<Option<Vec<[f32; 2]>>> = crops_with_data.iter().map(|(_, _, p)| p.clone()).collect();
+            let crop_images: Vec<usls::Image> = crops_with_data.into_iter().map(|(img, _, _)| img).collect();
+
+            // Single batch forward pass
             let rec_results = match language {
                 Language::Chinese => {
                     if let Some(ref mut recognizer) = self.recognizer_chinese {
-                        recognizer.forward(&[crop_img])
-                            .map_err(|e| ExtensionError::ExecutionFailed(format!("Recognition failed: {}", e)))?
+                        match recognizer.forward(&crop_images) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                tracing::warn!("[OcrDeviceInference] Batch recognition failed, trying individually: {}", e);
+                                // Fallback: process individually on batch failure
+                                Self::recognize_individually(recognizer, &crop_images)?
+                            }
+                        }
                     } else {
                         return Err(ExtensionError::ExecutionFailed("Chinese recognizer not initialized".to_string()));
                     }
                 }
                 Language::English => {
                     if let Some(ref mut recognizer) = self.recognizer_english {
-                        recognizer.forward(&[crop_img])
-                            .map_err(|e| ExtensionError::ExecutionFailed(format!("Recognition failed: {}", e)))?
+                        match recognizer.forward(&crop_images) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                tracing::warn!("[OcrDeviceInference] Batch recognition failed, trying individually: {}", e);
+                                Self::recognize_individually(recognizer, &crop_images)?
+                            }
+                        }
                     } else {
                         return Err(ExtensionError::ExecutionFailed("English recognizer not initialized".to_string()));
                     }
                 }
             };
 
-            if let Some(rec_result) = rec_results.first() {
-                tracing::info!("[OcrDeviceInference] Recognition found {} texts", rec_result.texts.len());
-                for text_obj in &rec_result.texts {
-                    let text_str = text_obj.text().to_string();
-                    let conf = text_obj.confidence().unwrap_or(0.0);
-
-                    tracing::info!("[OcrDeviceInference] Recognized: '{}' (confidence: {:.2})", text_str, conf);
-
-                    // Draw bounding box + OCR text label on annotated image
-                    Self::draw_bbox_with_text(&mut annotated_img, &bbox, &text_str, conf, img_width, img_height);
-
-                    text_blocks.push(TextBlock {
-                        text: text_str.clone(),
-                        confidence: conf,
-                        bbox: bbox.clone(),
-                    });
-                    all_texts.push(text_str);
-                    total_confidence += conf;
+            // Map recognition results back to their bounding boxes
+            for (i, rec_result) in rec_results.iter().enumerate() {
+                if i >= bboxes.len() {
+                    break;
                 }
-            } else {
-                tracing::warn!("[OcrDeviceInference] Recognition returned no results for crop");
+                let bbox = &bboxes[i];
+                if !rec_result.texts.is_empty() {
+                    for text_obj in &rec_result.texts {
+                        let text_str = text_obj.text().to_string();
+                        let conf = text_obj.confidence().unwrap_or(0.0);
+
+                        tracing::debug!("[OcrDeviceInference] #{}: '{}' ({:.2})", i, text_str, conf);
+
+                        Self::draw_bbox_with_text(&mut annotated_img, bbox, &text_str, conf, img_width, img_height);
+
+                        text_blocks.push(TextBlock {
+                            text: text_str.clone(),
+                            confidence: conf,
+                            bbox: bbox.clone(),
+                            polygon: polygons[i].clone(),
+                        });
+                        all_texts.push(text_str);
+                        total_confidence += conf;
+                    }
+                }
             }
         }
 
@@ -704,6 +851,25 @@ impl OcrEngine {
         })
     }
 
+    /// Fallback: recognize images one-by-one when batch processing fails
+    /// (e.g., when individual crops have incompatible dimensions)
+    fn recognize_individually(
+        recognizer: &mut usls::models::SVTR,
+        images: &[usls::Image],
+    ) -> Result<Vec<usls::Y>> {
+        let mut results = Vec::with_capacity(images.len());
+        for img in images {
+            match recognizer.forward(&[img.clone()]) {
+                Ok(r) => results.extend(r),
+                Err(e) => {
+                    tracing::warn!("[OcrDeviceInference] Skipping crop: {}", e);
+                    results.push(usls::Y::default());
+                }
+            }
+        }
+        Ok(results)
+    }
+
     fn crop_polygon_static(img: &usls::Image, polygon: &usls::Polygon) -> Option<usls::Image> {
         let coords = polygon.points();
         if coords.is_empty() {
@@ -713,21 +879,24 @@ impl OcrEngine {
         let xs: Vec<f32> = coords.iter().map(|p| p[0]).collect();
         let ys: Vec<f32> = coords.iter().map(|p| p[1]).collect();
 
-        let x_min = xs.iter().cloned().fold(f32::INFINITY, f32::min) as u32;
-        let x_max = xs.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as u32;
-        let y_min = ys.iter().cloned().fold(f32::INFINITY, f32::min) as u32;
-        let y_max = ys.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as u32;
+        // Clamp coordinates to valid image bounds before casting to u32
+        // This prevents issues with negative coords or coords beyond image edges
+        let x_min = xs.iter().cloned().fold(f32::INFINITY, f32::min).max(0.0).min(img.width() as f32 - 1.0) as u32;
+        let x_max = xs.iter().cloned().fold(f32::NEG_INFINITY, f32::max).max(0.0).min(img.width() as f32 - 1.0) as u32;
+        let y_min = ys.iter().cloned().fold(f32::INFINITY, f32::min).max(0.0).min(img.height() as f32 - 1.0) as u32;
+        let y_max = ys.iter().cloned().fold(f32::NEG_INFINITY, f32::max).max(0.0).min(img.height() as f32 - 1.0) as u32;
 
-        let x_min = x_min.max(0);
-        let x_max = x_max.min(img.width() - 1);
-        let y_min = y_min.max(0);
-        let y_max = y_max.min(img.height() - 1);
+        let w = x_max.saturating_sub(x_min) + 1;
+        let h = y_max.saturating_sub(y_min) + 1;
 
-        if x_max <= x_min || y_max <= y_min {
+        // Skip crops too small for recognition (SVTR needs at least ~8px in each dimension)
+        const MIN_CROP_SIZE: u32 = 8;
+        if w < MIN_CROP_SIZE || h < MIN_CROP_SIZE {
+            tracing::debug!("[OcrDeviceInference] Skipping small crop: {}x{}", w, h);
             return None;
         }
 
-        let cropped = img.to_dyn().crop_imm(x_min, y_min, x_max - x_min + 1, y_max - y_min + 1);
+        let cropped = img.to_dyn().crop_imm(x_min, y_min, w, h);
         Some(cropped.into())
     }
 
