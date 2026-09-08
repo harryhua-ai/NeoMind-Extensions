@@ -34,6 +34,8 @@ pub struct Processor {
     pub pad_size: usize,
     pub up_scale: f32,
     pub do_resize: bool,
+    /// Swap R/B channels (BGR input) before feeding the model.
+    pub swap_rgb: bool,
 }
 
 impl Default for Processor {
@@ -59,6 +61,7 @@ impl Default for Processor {
             pad_size: 8,
             up_scale: 2.,
             do_resize: true,
+            swap_rgb: false,
         }
     }
 }
@@ -74,6 +77,11 @@ impl Processor {
         let tokenizer = config.try_build_tokenizer()?;
 
         // try to build vocab from `vocab.txt`
+        // PP-OCRv4+ dict convention: the dict file lists real characters
+        // only; the recognizer's character list is `['blank'] + dict_lines`,
+        // with the CTC blank at index 0. The postprocess filter `id != 0`
+        // skips the blank, so we prepend an empty-string placeholder to keep
+        // `vocab[id]` aligned with the model's character indices.
         let vocab: Vec<String> = match &config.vocab_txt {
             Some(x) => {
                 let file = if !std::path::PathBuf::from(&x).exists() {
@@ -81,10 +89,14 @@ impl Processor {
                 } else {
                     x.to_string()
                 };
-                std::fs::read_to_string(file)?
-                    .lines()
-                    .map(|line| line.to_string())
-                    .collect()
+                let mut v: Vec<String> = Vec::new();
+                v.push(String::new()); // blank placeholder at index 0
+                v.extend(
+                    std::fs::read_to_string(file)?
+                        .lines()
+                        .map(|line| line.to_string()),
+                );
+                v
             }
             None => vec![],
         };
@@ -105,6 +117,7 @@ impl Processor {
             pad_image: config.pad_image,
             pad_size: config.pad_size,
             up_scale: config.up_scale,
+            swap_rgb: config.swap_rgb,
             #[cfg(feature = "tokenizers")]
             tokenizer,
             vocab,
@@ -311,8 +324,15 @@ impl Processor {
             };
 
             // Convert image to Vec<f32>
-            let vec = image_processed.to_f32s();
+            let mut vec = image_processed.to_f32s();
             let do_standardize = !self.image_std.is_empty() && !self.image_mean.is_empty();
+
+            // Swap R/B channels (BGR input) if configured
+            if self.swap_rgb {
+                vec.par_chunks_mut(3).for_each(|pixel| {
+                    pixel.swap(0, 2);
+                });
+            }
 
             // Transformation
             let tensor = match self.image_tensor_layout {
@@ -607,6 +627,10 @@ impl Processor {
 
         if self.unsigned {
             x = x.unsigned();
+        }
+
+        if self.swap_rgb {
+            x = x.swap_rgb_channels(self.nchw)?;
         }
 
         Ok(x)

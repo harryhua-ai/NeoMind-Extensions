@@ -28,6 +28,8 @@ SKIP_PACKAGE=false
 DEV_MODE=false
 SINGLE_EXT=""
 MARKET_VERSION=""
+BUILD_VARIANT=""      # e.g., "jetson", "cuda" — empty = standard build
+CARGO_FEATURES=""     # extra cargo features, e.g., "nvdec"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -71,6 +73,14 @@ while [[ $# -gt 0 ]]; do
             SINGLE_EXT="$1"
             shift
             ;;
+        --variant)
+            BUILD_VARIANT="$2"
+            shift 2
+            ;;
+        --features)
+            CARGO_FEATURES="$2"
+            shift 2
+            ;;
         --help|-h)
             echo "NeoMind Extensions Build Script"
             echo ""
@@ -85,6 +95,9 @@ while [[ $# -gt 0 ]]; do
             echo "  --dev              Dev mode: build + install to NeoMind"
             echo "  --release [VER]    Release mode, optional version for filenames"
             echo "  --single <ext>     Build single extension only"
+            echo "  --variant <name>   Hardware variant suffix (e.g., jetson, cuda)"
+            echo "                      Produces xxx-linux_arm64-<name>.nep"
+            echo "  --features <list>  Extra cargo features (e.g., nvdec)"
             echo "  --help, -h         Show this help message"
             echo ""
             echo "Examples:"
@@ -92,6 +105,7 @@ while [[ $# -gt 0 ]]; do
             echo "  ./build.sh --dev                     # Dev build, auto-install"
             echo "  ./build.sh --release 2.4.0           # Release with version"
             echo "  ./build.sh --single weather-forecast-v2  # Single extension"
+            echo "  ./build.sh --single yolo-video-v2 --variant jetson --features nvdec  # Jetson build"
             exit 0
             ;;
         *)
@@ -145,6 +159,12 @@ case "$OS" in
         ;;
 esac
 
+VARIANT_SUFFIX=""
+if [ -n "$BUILD_VARIANT" ]; then
+    VARIANT_SUFFIX="-${BUILD_VARIANT}"
+    echo -e "${BLUE}Variant: $BUILD_VARIANT${NC}"
+fi
+
 # V2 Extensions list
 V2_EXTENSIONS=(
     "weather-forecast-v2"
@@ -152,6 +172,7 @@ V2_EXTENSIONS=(
     "yolo-video-v2"
     "yolo-device-inference"
     "ocr-device-inference"
+    "paddle-ocr-v6"
     "face-recognition"
     "stream-player"
     "wasm-demo"
@@ -163,6 +184,13 @@ V2_EXTENSIONS=(
     "onvif-bridge"
     "opcua-bridge"
     "locate-anything-v2"
+    "moss-tts-nano"
+    "cosyvoice-3"
+    "sensevoice-asr"
+    "voice-edge-tts"
+    "voice-assistant"
+    "paddle-ocr-vl"
+    "deepstream"
 )
 
 # Filter to single extension if specified
@@ -206,17 +234,24 @@ if [ ${#NATIVE_EXTENSIONS[@]} -gt 0 ]; then
     echo ""
     echo -e "${BLUE}Building Native Extensions...${NC}"
 
+    # Prepare cargo features args (used by both release and debug builds)
+    if [ -n "$CARGO_FEATURES" ]; then
+        CARGO_FEATURE_ARGS=(--features "$CARGO_FEATURES")
+    else
+        CARGO_FEATURE_ARGS=()
+    fi
+
     if [ "$BUILD_TYPE" = "release" ]; then
         for ext in "${NATIVE_EXTENSIONS[@]}"; do
             echo -e "  ${BLUE}Building${NC} $ext..."
-            if ! cargo build --release -p "$ext" 2>&1; then
+            if ! cargo build --release -p "$ext" "${CARGO_FEATURE_ARGS[@]}" 2>&1; then
                 echo -e "  ${RED}✗${NC} $ext build failed"
             fi
         done
     else
         for ext in "${NATIVE_EXTENSIONS[@]}"; do
             echo -e "  ${BLUE}Building${NC} $ext..."
-            if ! cargo build -p "$ext" 2>&1; then
+            if ! cargo build -p "$ext" "${CARGO_FEATURE_ARGS[@]}" 2>&1; then
                 echo -e "  ${RED}✗${NC} $ext build failed"
             fi
         done
@@ -423,9 +458,67 @@ if [ "$SKIP_PACKAGE" = false ] && [ "$BUILD_TYPE" = "release" ]; then
             fi
 
             if [ -n "$ORT_LIB" ] && [ -f "$ORT_LIB" ]; then
+                # ort crate (>=2.0.0-rc) dlopens the unversioned libonnxruntime.{dylib|so}
+                # at init time and panics if GetVersionString() doesn't match its pinned
+                # MINOR_VERSION (rc.10 → 1.22.x). Brew/macports often ship 1.21.x which
+                # is incompatible. Probe for a known-good 1.22 binary in sibling NeoMind
+                # extensions before falling back to the build-env discovery.
+                ORT_BASENAME=$(basename "$ORT_LIB")
+                ORT_MINOR=""
+                if [ "$OS" = "Darwin" ] && command -v otool &> /dev/null; then
+                    ORT_MINOR=$(otool -L "$ORT_LIB" 2>/dev/null | grep -oE 'current version [0-9]+\.[0-9]+' | head -1 | awk '{print $3}' | cut -d. -f2)
+                fi
+                if [ -z "$ORT_MINOR" ] && [ "$LIB_EXT" = "dylib" ]; then
+                    ORT_MINOR=$(echo "$ORT_BASENAME" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 | cut -d. -f2)
+                fi
+
+                # ort-sys 2.0.0-rc.10 requires ORT 1.22.x. If the discovered dylib is older,
+                # try to grab a known-good 1.22 binary from an already-installed NeoMind
+                # extension (ocr-device-inference, yolo-device-inference, etc. all share
+                # the same CoreML-enabled 33MB 1.22 build).
+                if [ "$LIB_EXT" = "dylib" ] && [ -n "$ORT_MINOR" ] && [ "$ORT_MINOR" != "22" ]; then
+                    echo -e "    ${YELLOW}⚠${NC} Found ORT 1.${ORT_MINOR}.x at $ORT_LIB but ort crate needs 1.22.x"
+                    NEOMIND_EXT_DIR="$HOME/Library/Application Support/com.neomind.neomind/data/extensions"
+                    FALLBACK=""
+                    if [ -d "$NEOMIND_EXT_DIR" ]; then
+                        for cand in ocr-device-inference yolo-device-inference image-analyzer-v2 yolo-video-v2; do
+                            cand_lib="$NEOMIND_EXT_DIR/$cand/binaries/$PLATFORM/libonnxruntime.dylib"
+                            if [ -f "$cand_lib" ]; then
+                                cand_minor=$(otool -L "$cand_lib" 2>/dev/null | grep -oE 'current version [0-9]+\.[0-9]+' | head -1 | awk '{print $3}' | cut -d. -f2)
+                                if [ "$cand_minor" = "22" ]; then
+                                    FALLBACK="$cand_lib"
+                                    echo -e "    ${GREEN}→${NC} Using known-good ORT 1.22 from $cand"
+                                    break
+                                fi
+                            fi
+                        done
+                    fi
+                    if [ -n "$FALLBACK" ]; then
+                        ORT_LIB="$FALLBACK"
+                        ORT_BASENAME=$(basename "$ORT_LIB")
+                    else
+                        echo -e "    ${RED}✗${NC} No ORT 1.22 fallback found. ort crate will panic at load time."
+                        echo -e "    Install onnxruntime 1.22.x (brew install onnxruntime@1.22 or download from"
+                        echo -e "    https://github.com/microsoft/onnxruntime/releases/tag/v1.22.0) and re-run."
+                        exit 1
+                    fi
+                fi
+
                 cp "$ORT_LIB" "$BINARY_DIR/"
                 chmod +x "$BINARY_DIR/$(basename $ORT_LIB)"
                 echo -e "    ${GREEN}→${NC} Bundled ONNX Runtime: $(basename $ORT_LIB)"
+
+                # Always provide the unversioned alias (ort crate dlopens it at init).
+                # Use `cp` not `ln -sf` — symlinks don't survive zip packaging.
+                ORT_BASENAME_NO_VER="libonnxruntime.$LIB_EXT"
+                if [ "$LIB_EXT" = "dll" ]; then
+                    ORT_BASENAME_NO_VER="onnxruntime.dll"
+                fi
+                if [ "$(basename $ORT_LIB)" != "$ORT_BASENAME_NO_VER" ]; then
+                    cp "$ORT_LIB" "$BINARY_DIR/$ORT_BASENAME_NO_VER"
+                    chmod +x "$BINARY_DIR/$ORT_BASENAME_NO_VER"
+                    echo -e "    ${GREEN}→${NC} Unversioned alias: $ORT_BASENAME_NO_VER (real copy, not symlink)"
+                fi
 
                 # Verify architecture matches the target platform
                 if [ "$OS" = "Darwin" ] && command -v file &> /dev/null; then
@@ -810,6 +903,19 @@ if [ "$SKIP_PACKAGE" = false ] && [ "$BUILD_TYPE" = "release" ]; then
             cp "$EXT_DIR/frontend/frontend.json" "$PACKAGE_DIR/"
         fi
 
+        # Copy sidecar/ (Python process extensions, e.g. DeepStream sidecar)
+        # Bundled recursively as a separate top-level directory in the package.
+        if [ -d "$EXT_DIR/sidecar" ]; then
+            mkdir -p "$PACKAGE_DIR/sidecar"
+            # Copy all .py files, __init__.py, requirements-*.txt, README.md
+            cp "$EXT_DIR/sidecar"/*.py "$PACKAGE_DIR/sidecar/" 2>/dev/null || true
+            cp "$EXT_DIR/sidecar"/__init__.py "$PACKAGE_DIR/sidecar/" 2>/dev/null || true
+            cp "$EXT_DIR/sidecar"/requirements-*.txt "$PACKAGE_DIR/sidecar/" 2>/dev/null || true
+            cp "$EXT_DIR/sidecar"/README.md "$PACKAGE_DIR/sidecar/" 2>/dev/null || true
+            SIDECAR_COUNT=$(ls "$PACKAGE_DIR/sidecar"/*.py 2>/dev/null | wc -l | tr -d ' ')
+            echo -e "    ${GREEN}→${NC} Bundled sidecar: $SIDECAR_COUNT .py files"
+        fi
+
         # Check if models are included
         HAS_MODELS="false"
         if [ -d "$EXT_DIR/models" ] && ls "$EXT_DIR/models"/*.onnx 1> /dev/null 2>&1; then
@@ -848,12 +954,20 @@ if [ "$SKIP_PACKAGE" = false ] && [ "$BUILD_TYPE" = "release" ]; then
             # e.g., yolo-video-v2 -> yolo-video-card (remove -v2 suffix for cleaner names)
             COMPONENT_TYPE=$(echo "$ext" | sed 's/-v2$//' | sed 's/-v1$//')"-card"
 
+            # For multi-component extensions, each component needs a unique type
+            # (NeoMind DynamicRegistry uses type as the registry key).
+            # We slugify the component's export name (PascalCase → kebab-case).
+            # Single-component extensions keep the extension-based type for backward compat.
+            COMPONENT_COUNT=$(jq '.components | length' "$FRONTEND_JSON" 2>/dev/null || echo "0")
+
             # Convert components to dashboard_components format
             # Note: category must be one of: chart, metric, table, control, media, custom, other
             if [ -n "$GLOBAL_NAME" ]; then
-                DASHBOARD_COMPONENTS=$(jq -c --arg entrypoint "$ACTUAL_ENTRYPOINT" --arg component_type "$COMPONENT_TYPE" --arg global_name "$GLOBAL_NAME" '
+                DASHBOARD_COMPONENTS=$(jq -c --arg entrypoint "$ACTUAL_ENTRYPOINT" --arg component_type "$COMPONENT_TYPE" --arg global_name "$GLOBAL_NAME" --argjson component_count "$COMPONENT_COUNT" '
                     [.components[] | {
-                        "type": $component_type,
+                        "type": (if $component_count > 1 then
+                            (.name | gsub("(?<=[a-z0-9])(?=[A-Z])"; "-") | ascii_downcase)
+                        else $component_type end),
                         "name": .displayName,
                         "description": .description,
                         "category": (if .type == "card" then "custom"
@@ -900,7 +1014,7 @@ if [ "$SKIP_PACKAGE" = false ] && [ "$BUILD_TYPE" = "release" ]; then
                                 }) | add // {}),
                                 "ui_hints": (if .uiHints then {
                                     "field_order": .uiHints.fieldOrder,
-                                    "visibility_rules": (.uiHints.visibilityRules | map({
+                                    "visibility_rules": ((.uiHints.visibilityRules // []) | map({
                                         "field": .field,
                                         "condition": .condition,
                                         "value": .value,
@@ -919,9 +1033,11 @@ if [ "$SKIP_PACKAGE" = false ] && [ "$BUILD_TYPE" = "release" ]; then
                 ' "$FRONTEND_JSON" 2>/dev/null)
                 echo -e "    ${BLUE}→${NC} Global name: $GLOBAL_NAME"
             else
-                DASHBOARD_COMPONENTS=$(jq -c --arg entrypoint "$ACTUAL_ENTRYPOINT" --arg component_type "$COMPONENT_TYPE" '
+                DASHBOARD_COMPONENTS=$(jq -c --arg entrypoint "$ACTUAL_ENTRYPOINT" --arg component_type "$COMPONENT_TYPE" --argjson component_count "$COMPONENT_COUNT" '
                     [.components[] | {
-                        "type": $component_type,
+                        "type": (if $component_count > 1 then
+                            (.name | gsub("(?<=[a-z0-9])(?=[A-Z])"; "-") | ascii_downcase)
+                        else $component_type end),
                         "name": .displayName,
                         "description": .description,
                         "category": (if .type == "card" then "custom"
@@ -967,7 +1083,7 @@ if [ "$SKIP_PACKAGE" = false ] && [ "$BUILD_TYPE" = "release" ]; then
                                 }) | add // {}),
                                 "ui_hints": (if .uiHints then {
                                     "field_order": .uiHints.fieldOrder,
-                                    "visibility_rules": (.uiHints.visibilityRules | map({
+                                    "visibility_rules": ((.uiHints.visibilityRules // []) | map({
                                         "field": .field,
                                         "condition": .condition,
                                         "value": .value,
@@ -1060,8 +1176,8 @@ if [ "$SKIP_PACKAGE" = false ] && [ "$BUILD_TYPE" = "release" ]; then
             # WASM is cross-platform, no platform suffix needed
             OUTPUT_FILE="dist/${ext}-${PACKAGE_VERSION}.nep"
         else
-            # Native extensions need platform suffix
-            OUTPUT_FILE="dist/${ext}-${PACKAGE_VERSION}-${PLATFORM}.nep"
+            # Native extensions need platform suffix (+ optional variant suffix)
+            OUTPUT_FILE="dist/${ext}-${PACKAGE_VERSION}-${PLATFORM}${VARIANT_SUFFIX}.nep"
         fi
         # Resolve absolute output path BEFORE changing directory
         # Create dist/ directory first to ensure it exists

@@ -1,0 +1,81 @@
+"""Browser WS frame encoder/decoder. Single source of truth for protocol."""
+from __future__ import annotations
+
+import json
+
+
+def encode_transcript(text: str) -> str:
+    return json.dumps({"type": "transcript", "text": text}, ensure_ascii=False)
+
+
+def encode_phase(phase: str, **metrics) -> str:
+    """phase: 'asr_start' | 'asr_end' | 'tts_start' | 'tts_end'."""
+    obj = {"type": phase}
+    obj.update(metrics)
+    return json.dumps(obj, ensure_ascii=False)
+
+
+def encode_stop() -> str:
+    return json.dumps({"type": "stop"})
+
+
+def encode_error(message: str) -> str:
+    return json.dumps({"type": "error", "message": message}, ensure_ascii=False)
+
+
+def encode_barge_in_ack() -> str:
+    return json.dumps({"type": "control", "action": "stop_playback",
+                       "reason": "barge_in"})
+
+
+def encode_llm_sentence(seq: int, text: str) -> str:
+    """Progressive subtitle frame — one per completed LLM sentence.
+
+    Optional frame: clients that don't handle ``llm_sentence`` can ignore
+    it without affecting PCM playback or tts_start/tts_end lifecycle.
+    """
+    return json.dumps(
+        {"type": "llm_sentence", "seq": seq, "text": text},
+        ensure_ascii=False,
+    )
+
+
+def encode_partial_transcript(text: str) -> str:
+    """Live subtitle frame — partial ASR transcript from streaming ASR.
+
+    The UI overwrites its current subtitle with each partial. The terminal
+    full transcript is delivered separately via ``encode_transcript`` once
+    ASR completes; clients that don't handle this frame can ignore it.
+    """
+    return json.dumps(
+        {"type": "partial_transcript", "text": text},
+        ensure_ascii=False,
+    )
+
+
+def encode_greeting(text: str) -> str:
+    """Greeting (say-first) frame — emitted once on session start,
+    followed by the pre-synthesized greeting PCM as binary frames.
+
+    Optional frame: clients without handling for ``greeting`` simply
+    ignore the text frame; the binary PCM still plays via the standard
+    playback queue. No ``tts_start``/``tts_end`` is emitted around
+    greeting (those mark turn lifecycle only).
+    """
+    return json.dumps(
+        {"type": "greeting", "text": text},
+        ensure_ascii=False,
+    )
+
+
+def decode_start(frame_text: str) -> dict:
+    """Parse a 'start' text frame from browser."""
+    obj = json.loads(frame_text)
+    return obj  # caller checks type == "start"
+
+
+def decode_ping(frame_text: str) -> bool:
+    try:
+        return json.loads(frame_text).get("type") == "ping"
+    except (json.JSONDecodeError, AttributeError):
+        return False

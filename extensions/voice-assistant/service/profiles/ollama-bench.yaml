@@ -1,0 +1,31 @@
+name: ollama-bench
+description: "Benchmark profile: Ollama direct LLM, energy VAD, no AEC"
+hardware:
+  cpu_threads: 4
+acoustic:
+  vad_backend: silero
+  vad_threshold: 0.5
+  vad_min_speech_ms: 250
+  vad_silence_ms: 500
+  aec: none
+backends:
+  asr:
+    type: sensevoice_http
+    url: http://127.0.0.1:9383
+    language: auto
+  llm:
+    type: ollama_http
+    url: http://127.0.0.1:11434
+    model: qwen3.5:0.8b-mlx
+  tts:
+    type: moss_tts_http
+    url: http://127.0.0.1:9382
+    voice: Mei
+interaction:
+  barge_in: full
+  latency_target_ms: 1500
+  barge_in_ack: true
+  ack_words: ["好的", "嗯哼", "明白"]
+  stage_filler_words:
+    thinking: ["让我想想", "嗯,让我想想", "稍等一下"]
+    tool_call: ["我查一下", "搜索中", "查一下资料"]

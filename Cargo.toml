@@ -18,6 +18,14 @@ members = [
     "extensions/onvif-bridge",
     "extensions/bacnet-bridge",
     "extensions/locate-anything-v2",
+    "extensions/moss-tts-nano",
+    "extensions/sensevoice-asr",
+    "extensions/cosyvoice-3",
+    "extensions/voice-edge-tts",
+    "extensions/voice-assistant",
+    "extensions/paddle-ocr-v6",
+    "extensions/paddle-ocr-vl",
+    "extensions/deepstream",
     # "extensions/final-test",
     # "extensions/cli-test-ext",
 ]
@@ -50,7 +58,7 @@ ort = { version = "2.0.0-rc.10", default-features = false, features = ["half", "
 
 ndarray = "0.16"
 
-neomind-extension-sdk = "0.6.3"
+neomind-extension-sdk = "0.6.4"
 
 # Patch usls to skip unreliable is_available() check for CUDA EP.
 # When ORT is loaded dynamically (load-dynamic), GetAvailableProviders()
